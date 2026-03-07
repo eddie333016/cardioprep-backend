@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: cardioprep-backend
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: OPENAI_API_KEY
+        value: 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
+      - key: USE_AUTH
+        value: false
+      - key: PORT
+        value: 10000
