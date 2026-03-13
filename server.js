@@ -15,6 +15,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const USE_AUTH = process.env.USE_AUTH === 'true';
 const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview-2024-12-17';
 const SCORING_MODEL = process.env.OPENAI_SCORING_MODEL || 'gpt-4.1-mini';
+const CONVERSATION_MODEL = process.env.OPENAI_CONVERSATION_MODEL || 'gpt-4o-mini';
 
 if (!OPENAI_API_KEY) {
   console.warn('⚠️ OPENAI_API_KEY is not set. Realtime and scoring requests will fail.');
@@ -108,6 +109,34 @@ function normalizeScorePayload(payload) {
   };
 }
 
+async function chatCompletion({ model, messages, temperature = 0.7, response_format }) {
+  const body = { model, messages, temperature };
+  if (response_format) {
+    body.response_format = response_format;
+  }
+
+  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data?.error?.message || 'OpenAI chat completion request failed');
+  }
+
+  const content = data.choices?.[0]?.message?.content;
+  if (!content) {
+    throw new Error('OpenAI chat completion response was empty');
+  }
+
+  return { content, usage: data.usage || null };
+}
+
 async function requestScoringFromOpenAI({ transcript, patientName }) {
   const rubric = `You are an expert cardiology exam assessor. Evaluate the transcript of a mock clinical exam.
 Return strict JSON with exactly these keys:
@@ -119,37 +148,44 @@ Rules:
 - feedback is a concise paragraph
 - overallScore should reflect the whole performance, not just a simple average if nuance matters`;
 
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: SCORING_MODEL,
-      temperature: 0.2,
-      response_format: { type: 'json_object' },
-      messages: [
-        { role: 'system', content: rubric },
-        {
-          role: 'user',
-          content: `Patient: ${patientName}\n\nTranscript:\n${transcript}`,
-        },
-      ],
-    }),
+  const { content } = await chatCompletion({
+    model: SCORING_MODEL,
+    temperature: 0.2,
+    response_format: { type: 'json_object' },
+    messages: [
+      { role: 'system', content: rubric },
+      {
+        role: 'user',
+        content: `Patient: ${patientName}\n\nTranscript:\n${transcript}`,
+      },
+    ],
   });
 
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error(data?.error?.message || 'OpenAI scoring request failed');
-  }
-
-  const content = data.choices?.[0]?.message?.content;
-  if (!content) {
-    throw new Error('OpenAI scoring response was empty');
-  }
-
   return normalizeScorePayload(JSON.parse(content));
+}
+
+async function requestConversationResponse({ systemPrompt, history, userMessage, role }) {
+  const messages = [];
+  if (systemPrompt) {
+    messages.push({ role: 'system', content: systemPrompt });
+  }
+  for (const turn of history || []) {
+    if (!turn || typeof turn.role !== 'string' || typeof turn.content !== 'string') continue;
+    messages.push({ role: turn.role, content: turn.content });
+  }
+  messages.push({ role: 'user', content: userMessage });
+
+  const { content, usage } = await chatCompletion({
+    model: CONVERSATION_MODEL,
+    temperature: role === 'examiner' ? 0.5 : 0.8,
+    messages,
+  });
+
+  return {
+    text: content.trim(),
+    model: CONVERSATION_MODEL,
+    usage,
+  };
 }
 
 app.post('/api/score', async (req, res) => {
@@ -179,6 +215,39 @@ app.post('/api/score', async (req, res) => {
     res.json(score);
   } catch (error) {
     console.error('❌ Scoring failed:', error.message);
+    res.status(502).json({ error: error.message });
+  }
+});
+
+app.post('/api/conversation', async (req, res) => {
+  if (!requireOpenAIKey(res)) {
+    return;
+  }
+
+  let user;
+  try {
+    user = await authenticateRequest(req);
+  } catch (error) {
+    res.status(401).json({ error: error.message });
+    return;
+  }
+
+  const systemPrompt = typeof req.body?.systemPrompt === 'string' ? req.body.systemPrompt.trim() : '';
+  const userMessage = typeof req.body?.userMessage === 'string' ? req.body.userMessage.trim() : '';
+  const role = req.body?.role === 'examiner' ? 'examiner' : 'patient';
+  const history = Array.isArray(req.body?.history) ? req.body.history : [];
+
+  if (!systemPrompt || !userMessage) {
+    res.status(400).json({ error: 'systemPrompt and userMessage are required.' });
+    return;
+  }
+
+  try {
+    const result = await requestConversationResponse({ systemPrompt, history, userMessage, role });
+    console.log(`💬 Conversation response for ${user.email || user.uid} role=${role} history=${history.length}`);
+    res.json(result);
+  } catch (error) {
+    console.error('❌ Conversation failed:', error.message);
     res.status(502).json({ error: error.message });
   }
 });
