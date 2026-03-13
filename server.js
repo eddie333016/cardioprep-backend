@@ -214,6 +214,7 @@ wss.on('connection', async (clientWs, req) => {
       'OpenAI-Beta': 'realtime=v1',
     },
   });
+  const pendingClientMessages = [];
 
   const sessionId = `${user.uid}-${Date.now()}`;
   const sessionStartTime = Date.now();
@@ -262,7 +263,13 @@ wss.on('connection', async (clientWs, req) => {
   clientWs.on('message', (data) => {
     if (openaiWs.readyState === WebSocket.OPEN) {
       openaiWs.send(data);
+      return;
     }
+    if (openaiWs.readyState === WebSocket.CONNECTING) {
+      pendingClientMessages.push(data);
+      return;
+    }
+    console.log('⚠️ Dropping client message because OpenAI websocket is closed');
   });
 
   openaiWs.on('error', (error) => {
@@ -281,6 +288,9 @@ wss.on('connection', async (clientWs, req) => {
 
   openaiWs.on('open', () => {
     console.log(`✅ OpenAI connected for session: ${sessionId}`);
+    while (pendingClientMessages.length > 0 && openaiWs.readyState === WebSocket.OPEN) {
+      openaiWs.send(pendingClientMessages.shift());
+    }
   });
 });
 
