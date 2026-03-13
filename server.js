@@ -10,156 +10,284 @@ const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-
-// Initialize Firebase Admin (will configure later with service account)
-// For now, skip Firebase auth in dev mode
 const USE_AUTH = process.env.USE_AUTH === 'true';
+const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview-2024-12-17';
+const SCORING_MODEL = process.env.OPENAI_SCORING_MODEL || 'gpt-4.1-mini';
+
+if (!OPENAI_API_KEY) {
+  console.warn('⚠️ OPENAI_API_KEY is not set. Realtime and scoring requests will fail.');
+}
 
 if (USE_AUTH && process.env.FIREBASE_SERVICE_ACCOUNT) {
   const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
   admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
+    credential: admin.credential.cert(serviceAccount),
   });
   console.log('✅ Firebase Admin initialized');
 } else {
-  console.log('⚠️  Firebase Auth disabled (dev mode)');
+  console.log('⚠️ Firebase Auth disabled (dev mode)');
 }
 
-// Middleware
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
+const activeSessions = new Map();
+
+app.get('/health', (_req, res) => {
+  res.json({
+    status: 'ok',
     timestamp: new Date().toISOString(),
-    auth: USE_AUTH ? 'enabled' : 'disabled'
+    auth: USE_AUTH ? 'enabled' : 'disabled',
+    realtimeModel: REALTIME_MODEL,
+    scoringModel: SCORING_MODEL,
   });
 });
 
-// Session tracking
-const activeSessions = new Map();
+function getAuthTokenFromRequest(req) {
+  const header = req.headers.authorization;
+  if (header?.startsWith('Bearer ')) {
+    return header.slice('Bearer '.length).trim();
+  }
 
-// Verify Firebase token
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  return url.searchParams.get('token');
+}
+
 async function verifyToken(token) {
   if (!USE_AUTH) {
-    return { uid: 'dev-user', email: 'dev@cardioprep.com' };
+    return { uid: 'dev-user', email: 'dev@cardioprep.local' };
   }
-  
+
+  if (!token) {
+    throw new Error('Missing auth token');
+  }
+
   try {
-    const decodedToken = await admin.auth().verifyIdToken(token);
-    return decodedToken;
-  } catch (error) {
+    return await admin.auth().verifyIdToken(token);
+  } catch {
     throw new Error('Invalid auth token');
   }
 }
 
-// WebSocket handler for Realtime API
-wss.on('connection', async (clientWs, req) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const token = url.searchParams.get('token');
-  
-  console.log('📱 Client connection attempt...');
-  
-  // Verify auth token
+async function authenticateRequest(req) {
+  const token = getAuthTokenFromRequest(req);
+  return verifyToken(token);
+}
+
+function requireOpenAIKey(res) {
+  if (OPENAI_API_KEY) {
+    return true;
+  }
+
+  res.status(500).json({ error: 'OPENAI_API_KEY is not configured on the backend.' });
+  return false;
+}
+
+function normalizeScorePayload(payload) {
+  const strengths = Array.isArray(payload.strengths) ? payload.strengths : [];
+  const improvements = Array.isArray(payload.improvements) ? payload.improvements : [];
+
+  const historyScore = Number(payload.historyScore) || 0;
+  const presentationScore = Number(payload.presentationScore) || 0;
+  const reasoningScore = Number(payload.reasoningScore) || 0;
+  const discussionScore = Number(payload.discussionScore) || 0;
+  const computedOverall = Math.round(
+    (historyScore + presentationScore + reasoningScore + discussionScore) / 4,
+  );
+
+  return {
+    overallScore: Number(payload.overallScore) || computedOverall,
+    historyScore,
+    presentationScore,
+    reasoningScore,
+    discussionScore,
+    feedback: typeof payload.feedback === 'string' ? payload.feedback : 'No feedback returned.',
+    strengths: strengths.map(String).slice(0, 5),
+    improvements: improvements.map(String).slice(0, 5),
+  };
+}
+
+async function requestScoringFromOpenAI({ transcript, patientName }) {
+  const rubric = `You are an expert cardiology exam assessor. Evaluate the transcript of a mock clinical exam.
+Return strict JSON with exactly these keys:
+overallScore, historyScore, presentationScore, reasoningScore, discussionScore, feedback, strengths, improvements
+Rules:
+- scores are integers from 0 to 100
+- strengths is an array of 2 to 5 short bullet strings
+- improvements is an array of 2 to 5 short bullet strings
+- feedback is a concise paragraph
+- overallScore should reflect the whole performance, not just a simple average if nuance matters`;
+
+  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: SCORING_MODEL,
+      temperature: 0.2,
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: rubric },
+        {
+          role: 'user',
+          content: `Patient: ${patientName}\n\nTranscript:\n${transcript}`,
+        },
+      ],
+    }),
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data?.error?.message || 'OpenAI scoring request failed');
+  }
+
+  const content = data.choices?.[0]?.message?.content;
+  if (!content) {
+    throw new Error('OpenAI scoring response was empty');
+  }
+
+  return normalizeScorePayload(JSON.parse(content));
+}
+
+app.post('/api/score', async (req, res) => {
+  if (!requireOpenAIKey(res)) {
+    return;
+  }
+
   let user;
   try {
-    user = await verifyToken(token);
-    console.log(`✅ User authenticated: ${user.email}`);
+    user = await authenticateRequest(req);
+  } catch (error) {
+    res.status(401).json({ error: error.message });
+    return;
+  }
+
+  const transcript = typeof req.body?.transcript === 'string' ? req.body.transcript.trim() : '';
+  const patientName = typeof req.body?.patientName === 'string' ? req.body.patientName.trim() : 'Unknown patient';
+
+  if (!transcript) {
+    res.status(400).json({ error: 'Transcript is required.' });
+    return;
+  }
+
+  try {
+    const score = await requestScoringFromOpenAI({ transcript, patientName });
+    console.log(`📊 Scored transcript for ${user.email || user.uid} (${transcript.length} chars)`);
+    res.json(score);
+  } catch (error) {
+    console.error('❌ Scoring failed:', error.message);
+    res.status(502).json({ error: error.message });
+  }
+});
+
+wss.on('connection', async (clientWs, req) => {
+  console.log('📱 Client connection attempt...');
+
+  let user;
+  try {
+    user = await authenticateRequest(req);
+    console.log(`✅ User authenticated: ${user.email || user.uid}`);
   } catch (error) {
     console.log('❌ Auth failed:', error.message);
     clientWs.close(4001, 'Unauthorized');
     return;
   }
-  
-  // Check rate limits (simple in-memory for now)
+
+  if (!OPENAI_API_KEY) {
+    clientWs.close(1011, 'Backend missing OPENAI_API_KEY');
+    return;
+  }
+
   const userSessions = activeSessions.get(user.uid) || [];
   if (userSessions.length >= 3) {
-    console.log(`⛔ Rate limit: User ${user.email} has ${userSessions.length} active sessions`);
+    console.log(`⛔ Rate limit: ${user.email || user.uid} has ${userSessions.length} active sessions`);
     clientWs.close(4029, 'Too many active sessions');
     return;
   }
-  
-  // Connect to OpenAI Realtime API
-  const openaiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17', {
+
+  const openaiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`, {
     headers: {
-      'Authorization': `Bearer ${OPENAI_API_KEY}`,
-      'OpenAI-Beta': 'realtime=v1'
-    }
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      'OpenAI-Beta': 'realtime=v1',
+    },
   });
-  
+
   const sessionId = `${user.uid}-${Date.now()}`;
-  let sessionStartTime = Date.now();
-  
-  // Track session
+  const sessionStartTime = Date.now();
+  let cleanedUp = false;
+
   userSessions.push(sessionId);
   activeSessions.set(user.uid, userSessions);
-  
   console.log(`🔗 OpenAI connection initiated for session: ${sessionId}`);
-  
-  // OpenAI -> Client
+
+  const cleanup = () => {
+    if (cleanedUp) {
+      return;
+    }
+    cleanedUp = true;
+
+    const durationMinutes = ((Date.now() - sessionStartTime) / 1000 / 60).toFixed(2);
+    console.log(`🔚 Session ended: ${sessionId} (${durationMinutes} min)`);
+
+    const sessions = activeSessions.get(user.uid) || [];
+    const index = sessions.indexOf(sessionId);
+    if (index > -1) {
+      sessions.splice(index, 1);
+    }
+    if (sessions.length === 0) {
+      activeSessions.delete(user.uid);
+    } else {
+      activeSessions.set(user.uid, sessions);
+    }
+
+    console.log(`📊 Usage: ${user.email || user.uid} - ${durationMinutes} minutes`);
+
+    if (openaiWs.readyState === WebSocket.OPEN || openaiWs.readyState === WebSocket.CONNECTING) {
+      openaiWs.close();
+    }
+    if (clientWs.readyState === WebSocket.OPEN || clientWs.readyState === WebSocket.CONNECTING) {
+      clientWs.close();
+    }
+  };
+
   openaiWs.on('message', (data) => {
     if (clientWs.readyState === WebSocket.OPEN) {
       clientWs.send(data);
     }
   });
-  
-  // Client -> OpenAI
+
   clientWs.on('message', (data) => {
     if (openaiWs.readyState === WebSocket.OPEN) {
       openaiWs.send(data);
     }
   });
-  
-  // Handle errors
+
   openaiWs.on('error', (error) => {
     console.log('❌ OpenAI error:', error.message);
-    clientWs.close(1011, 'OpenAI connection error');
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.close(1011, 'OpenAI connection error');
+    }
   });
-  
+
   clientWs.on('error', (error) => {
     console.log('❌ Client error:', error.message);
   });
-  
-  // Handle closures
-  const cleanup = () => {
-    const duration = ((Date.now() - sessionStartTime) / 1000 / 60).toFixed(2);
-    console.log(`🔚 Session ended: ${sessionId} (${duration} min)`);
-    
-    // Remove from active sessions
-    const sessions = activeSessions.get(user.uid) || [];
-    const index = sessions.indexOf(sessionId);
-    if (index > -1) {
-      sessions.splice(index, 1);
-      if (sessions.length === 0) {
-        activeSessions.delete(user.uid);
-      } else {
-        activeSessions.set(user.uid, sessions);
-      }
-    }
-    
-    // Log usage (in production, save to Firestore)
-    console.log(`📊 Usage: ${user.email} - ${duration} minutes`);
-    
-    // Close both connections
-    if (openaiWs.readyState === WebSocket.OPEN) openaiWs.close();
-    if (clientWs.readyState === WebSocket.OPEN) clientWs.close();
-  };
-  
+
   openaiWs.on('close', cleanup);
   clientWs.on('close', cleanup);
-  
+
   openaiWs.on('open', () => {
     console.log(`✅ OpenAI connected for session: ${sessionId}`);
   });
 });
 
-// Start server
 server.listen(PORT, () => {
   console.log(`🚀 CardioPrep Backend running on port ${PORT}`);
   console.log(`   Health check: http://localhost:${PORT}/health`);
-  console.log(`   WebSocket: ws://localhost:${PORT}?token=YOUR_TOKEN`);
+  console.log(`   WebSocket: ws://localhost:${PORT}?token=<firebase-id-token>`);
+  console.log(`   Scoring:   http://localhost:${PORT}/api/score`);
   console.log(`   Auth: ${USE_AUTH ? 'ENABLED' : 'DISABLED (dev mode)'}`);
 });

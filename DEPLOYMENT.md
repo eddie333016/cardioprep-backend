@@ -1,107 +1,38 @@
 # CardioPrep Backend Deployment Guide
 
-## Railway Deployment (Recommended)
+## Recommended target
+Current production-style host:
+- `https://cardioprep-backend.onrender.com`
 
-1. Install Railway CLI:
+## Required environment variables
+- `OPENAI_API_KEY`
+- `PORT` (Render commonly injects this)
+
+## Optional / production auth
+- `USE_AUTH=true`
+- `FIREBASE_SERVICE_ACCOUNT=<json>`
+- `OPENAI_REALTIME_MODEL=<override>`
+- `OPENAI_SCORING_MODEL=<override>`
+
+## Render deployment
+1. Connect the repo in Render.
+2. Ensure `OPENAI_API_KEY` is set as a secret in Render.
+3. Set `USE_AUTH=true` only when Firebase Admin credentials are configured.
+4. If auth is enabled, set `FIREBASE_SERVICE_ACCOUNT` as a secret JSON string.
+5. Deploy.
+
+## After deploy
 ```bash
-npm install -g @railway/cli
+curl https://cardioprep-backend.onrender.com/health
 ```
 
-2. Login:
-```bash
-railway login
-```
+If auth is enabled, also verify:
+- websocket connection from the app succeeds
+- `POST /api/score` accepts a valid Firebase ID token
 
-3. Create new project:
-```bash
-railway init
-```
+## App config alignment
+The iOS app uses:
+- debug websocket: `ws://localhost:3000`
+- release websocket: `wss://cardioprep-backend.onrender.com`
 
-4. Set environment variables:
-```bash
-railway variables set OPENAI_API_KEY=sk-svcacct-...
-railway variables set USE_AUTH=false
-railway variables set PORT=3000
-```
-
-5. Deploy:
-```bash
-railway up
-```
-
-6. Get URL:
-```bash
-railway status
-```
-
-## Alternative: Render Deployment
-
-1. Go to https://render.com
-2. New > Web Service
-3. Connect GitHub repo
-4. Environment variables:
-   - OPENAI_API_KEY
-   - USE_AUTH=false
-   - PORT=3000
-5. Deploy
-
-## Alternative: Fly.io Deployment
-
-1. Install flyctl:
-```bash
-curl -L https://fly.io/install.sh | sh
-```
-
-2. Login:
-```bash
-flyctl auth login
-```
-
-3. Launch:
-```bash
-flyctl launch
-```
-
-4. Set secrets:
-```bash
-flyctl secrets set OPENAI_API_KEY=sk-svcacct-...
-```
-
-5. Deploy:
-```bash
-flyctl deploy
-```
-
-## Environment Variables
-
-Required:
-- `OPENAI_API_KEY` - OpenAI API key
-- `USE_AUTH` - Enable Firebase auth (false for testing)
-- `PORT` - Server port (default: 3000)
-
-Optional (for production):
-- `FIREBASE_SERVICE_ACCOUNT` - Firebase service account JSON
-
-## Testing After Deployment
-
-```bash
-# Health check
-curl https://your-app.up.railway.app/health
-
-# WebSocket test (requires wscat)
-wscat -c "wss://your-app.up.railway.app?token=dev-token"
-```
-
-## Update iOS App
-
-After deployment, update `Config.swift`:
-
-```swift
-public static var backendURL: String {
-    #if DEBUG
-    return "ws://localhost:3000"
-    #else
-    return "wss://your-app.up.railway.app"  // ← Update this
-    #endif
-}
-```
+The app derives the scoring endpoint automatically from the websocket base URL, so keep the backend host consistent.

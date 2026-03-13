@@ -1,43 +1,63 @@
 # CardioPrep Backend Proxy
 
-WebSocket proxy for OpenAI Realtime API with Firebase authentication.
+Hermes-operated backend for CardioPrep.
 
-## Features
+## Responsibilities
 
-- ✅ WebSocket proxy to OpenAI Realtime API
-- ✅ Firebase token verification
-- ✅ Rate limiting (3 concurrent sessions per user)
-- ✅ Usage logging
-- ✅ Dev mode (auth disabled for testing)
+- WebSocket proxy to the OpenAI Realtime API
+- Firebase token verification when auth is enabled
+- Session rate limiting (3 concurrent sessions per user)
+- Transcript scoring via `POST /api/score`
+- Health reporting via `GET /health`
 
-## Setup
+## Endpoints
+
+- `GET /health`
+- `WS /?token=<firebase-id-token>`
+- `POST /api/score`
+  - Header: `Authorization: Bearer <firebase-id-token>` when auth is enabled
+  - JSON body:
+    ```json
+    {
+      "transcript": "...",
+      "patientName": "Margaret"
+    }
+    ```
+
+## Environment variables
+
+### Required
+- `OPENAI_API_KEY`
+
+### Common
+- `PORT` — defaults to `3000`
+- `USE_AUTH` — `true` or `false`
+- `FIREBASE_SERVICE_ACCOUNT` — JSON service account string when `USE_AUTH=true`
+- `OPENAI_REALTIME_MODEL` — optional override for websocket model
+- `OPENAI_SCORING_MODEL` — optional override for scoring model
+
+## Local development
 
 ```bash
+cd ~/Projects/cardioprep-backend
 npm install
 npm start
 ```
 
-## Environment Variables
-
-- `OPENAI_API_KEY` - OpenAI API key
-- `PORT` - Server port (default: 3000)
-- `USE_AUTH` - Enable Firebase auth (true/false)
-- `FIREBASE_SERVICE_ACCOUNT` - Firebase service account JSON
-
-## Endpoints
-
-- `GET /health` - Health check
-- `WS /?token=<firebase-token>` - WebSocket proxy
-
-## Development
+## Smoke tests
 
 ```bash
-npm run dev  # Auto-reload on changes
+curl http://localhost:3000/health
 ```
 
-## Deployment
+If auth is disabled, you can also test scoring locally:
 
-Deploy to Railway/Render/Fly.io:
-1. Set environment variables
-2. Deploy from GitHub
-3. Update iOS app with backend URL
+```bash
+curl -X POST http://localhost:3000/api/score \
+  -H 'Content-Type: application/json' \
+  -d '{"transcript":"Short demo transcript","patientName":"Demo Patient"}'
+```
+
+## Deployment note
+
+Do not store real secrets in `render.yaml` or in repo-local docs. Supply them through the Render dashboard or secret environment management.
