@@ -161,7 +161,14 @@ Rules:
     ],
   });
 
-  return normalizeScorePayload(JSON.parse(content));
+  let parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch (e) {
+    console.error('OpenAI returned non-JSON:', content.slice(0, 200));
+    throw new Error(`OpenAI returned malformed JSON: ${e.message}`);
+  }
+  return normalizeScorePayload(parsed);
 }
 
 async function requestConversationResponse({ systemPrompt, history, userMessage, role }) {
@@ -289,6 +296,13 @@ wss.on('connection', async (clientWs, req) => {
   const sessionStartTime = Date.now();
   let cleanedUp = false;
 
+  // Keep-alive ping every 30s (Render drops idle connections after 55s)
+  const pingInterval = setInterval(() => {
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.ping();
+    }
+  }, 30000);
+
   userSessions.push(sessionId);
   activeSessions.set(user.uid, userSessions);
   console.log(`🔗 OpenAI connection initiated for session: ${sessionId}`);
@@ -298,6 +312,7 @@ wss.on('connection', async (clientWs, req) => {
       return;
     }
     cleanedUp = true;
+    clearInterval(pingInterval);
 
     const durationMinutes = ((Date.now() - sessionStartTime) / 1000 / 60).toFixed(2);
     console.log(`🔚 Session ended: ${sessionId} (${durationMinutes} min)`);
@@ -323,13 +338,55 @@ wss.on('connection', async (clientWs, req) => {
     }
   };
 
+  // Events we log from OpenAI → client (significant state changes only, not audio deltas)
+  const LOGGED_OPENAI_EVENTS = new Set([
+    'session.created', 'session.updated', 'session.error',
+    'input_audio_buffer.speech_started', 'input_audio_buffer.speech_stopped',
+    'input_audio_buffer.committed',
+    'conversation.item.input_audio_transcription.completed',
+    'conversation.item.input_audio_transcription.failed',
+    'response.created', 'response.done', 'response.cancelled',
+    'response.audio_transcript.done',
+    'error', 'rate_limits.updated',
+  ]);
+
   openaiWs.on('message', (data) => {
+    // Parse and log significant events (skip audio deltas to avoid log spam)
+    try {
+      const str = Buffer.isBuffer(data) ? data.toString() : data;
+      const evt = JSON.parse(str);
+      if (LOGGED_OPENAI_EVENTS.has(evt.type)) {
+        const extra = evt.type === 'conversation.item.input_audio_transcription.completed'
+          ? ` transcript="${(evt.transcript || '').slice(0, 80)}"`
+          : evt.type === 'response.audio_transcript.done'
+          ? ` transcript="${(evt.transcript || '').slice(0, 80)}"`
+          : evt.type === 'error'
+          ? ` msg="${evt.error?.message}"`
+          : '';
+        console.log(`[${sessionId}] ← OpenAI: ${evt.type}${extra}`);
+      }
+    } catch {
+      // binary/non-JSON — ignore
+    }
     if (clientWs.readyState === WebSocket.OPEN) {
       clientWs.send(data);
     }
   });
 
   clientWs.on('message', (data) => {
+    if (Buffer.isBuffer(data) && data.length > 500000) {
+      console.warn(`⚠️ Oversized WS message (${data.length} bytes), dropping`);
+      return;
+    }
+    // Log significant client→OpenAI events (skip audio chunks)
+    try {
+      const str = Buffer.isBuffer(data) ? data.toString() : data;
+      const evt = JSON.parse(str);
+      if (evt.type && evt.type !== 'input_audio_buffer.append') {
+        console.log(`[${sessionId}] → Client: ${evt.type}`);
+      }
+    } catch { /* binary */ }
+
     if (openaiWs.readyState === WebSocket.OPEN) {
       openaiWs.send(data);
       return;
