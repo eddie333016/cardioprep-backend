@@ -420,6 +420,89 @@ wss.on('connection', async (clientWs, req) => {
   });
 });
 
+// ──────────────────────────────────────────────────────────
+// Remote Diagnostic Logging — POST /api/logs
+// The iOS app ships voice-engine diagnostic logs here so we
+// can triage issues without Xcode attached.
+// GET  /api/logs?limit=100&since=<ISO>&device=<id>
+// POST /api/logs  body: { device, logs: [{ts, tag, msg}] }
+// ──────────────────────────────────────────────────────────
+const diagnosticLogs = [];          // in-memory ring buffer
+const MAX_DIAGNOSTIC_LOGS = 5000;   // keep last 5000 entries
+
+app.post('/api/logs', async (req, res) => {
+  let user;
+  try {
+    user = await authenticateRequest(req);
+  } catch (error) {
+    res.status(401).json({ error: error.message });
+    return;
+  }
+
+  const device = typeof req.body?.device === 'string' ? req.body.device : 'unknown';
+  const entries = Array.isArray(req.body?.logs) ? req.body.logs : [];
+
+  if (entries.length === 0) {
+    res.status(400).json({ error: 'No log entries provided.' });
+    return;
+  }
+
+  let added = 0;
+  for (const entry of entries.slice(0, 200)) {  // max 200 per batch
+    diagnosticLogs.push({
+      uid: user.uid,
+      email: user.email || user.uid,
+      device,
+      ts: entry.ts || new Date().toISOString(),
+      tag: typeof entry.tag === 'string' ? entry.tag : 'app',
+      msg: typeof entry.msg === 'string' ? entry.msg.slice(0, 2000) : '',
+      received: new Date().toISOString(),
+    });
+    added++;
+  }
+
+  // Trim ring buffer
+  while (diagnosticLogs.length > MAX_DIAGNOSTIC_LOGS) {
+    diagnosticLogs.shift();
+  }
+
+  console.log(`📋 Received ${added} diagnostic logs from ${user.email || user.uid} (${device})`);
+  res.json({ ok: true, received: added });
+});
+
+app.get('/api/logs', async (req, res) => {
+  // Auth optional for dev — in prod this should require admin auth
+  let user;
+  try {
+    user = await authenticateRequest(req);
+  } catch (error) {
+    res.status(401).json({ error: error.message });
+    return;
+  }
+
+  const limit = Math.min(parseInt(req.query.limit || '100', 10), 1000);
+  const since = req.query.since ? new Date(req.query.since) : null;
+  const deviceFilter = req.query.device || null;
+  const tagFilter = req.query.tag || null;
+
+  let results = diagnosticLogs;
+
+  if (since && !isNaN(since.getTime())) {
+    results = results.filter(l => new Date(l.ts) >= since);
+  }
+  if (deviceFilter) {
+    results = results.filter(l => l.device === deviceFilter);
+  }
+  if (tagFilter) {
+    results = results.filter(l => l.tag === tagFilter);
+  }
+
+  res.json({
+    total: results.length,
+    logs: results.slice(-limit),
+  });
+});
+
 server.listen(PORT, () => {
   console.log(`🚀 CardioPrep Backend running on port ${PORT}`);
   console.log(`   Health check: http://localhost:${PORT}/health`);
