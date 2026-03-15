@@ -424,11 +424,24 @@ wss.on('connection', async (clientWs, req) => {
 // Remote Diagnostic Logging — POST /api/logs
 // The iOS app ships voice-engine diagnostic logs here so we
 // can triage issues without Xcode attached.
-// GET  /api/logs?limit=100&since=<ISO>&device=<id>
+// GET  /api/logs?limit=100&since=<ISO>&device=<id>&tag=<tag>
 // POST /api/logs  body: { device, logs: [{ts, tag, msg}] }
+// DELETE /api/logs  — clear all logs
+//
+// Storage: Firestore (persistent) when Firebase is initialized,
+// otherwise falls back to in-memory ring buffer.
 // ──────────────────────────────────────────────────────────
-const diagnosticLogs = [];          // in-memory ring buffer
-const MAX_DIAGNOSTIC_LOGS = 5000;   // keep last 5000 entries
+const diagnosticLogs = [];          // in-memory ring buffer (fallback)
+const MAX_DIAGNOSTIC_LOGS = 5000;   // keep last 5000 entries in memory
+
+// Firestore collection reference (null if Firebase not initialized)
+function getLogsCollection() {
+  try {
+    return admin.firestore().collection('diagnostic_logs');
+  } catch {
+    return null;
+  }
+}
 
 app.post('/api/logs', async (req, res) => {
   let user;
@@ -447,9 +460,11 @@ app.post('/api/logs', async (req, res) => {
     return;
   }
 
+  const logsCol = getLogsCollection();
   let added = 0;
+
   for (const entry of entries.slice(0, 200)) {  // max 200 per batch
-    diagnosticLogs.push({
+    const logEntry = {
       uid: user.uid,
       email: user.email || user.uid,
       device,
@@ -457,21 +472,31 @@ app.post('/api/logs', async (req, res) => {
       tag: typeof entry.tag === 'string' ? entry.tag : 'app',
       msg: typeof entry.msg === 'string' ? entry.msg.slice(0, 2000) : '',
       received: new Date().toISOString(),
-    });
+    };
+
+    // Always keep in memory for fast reads
+    diagnosticLogs.push(logEntry);
+
+    // Persist to Firestore if available (fire-and-forget, don't block response)
+    if (logsCol) {
+      logsCol.add(logEntry).catch(err => {
+        console.error(`[Logs] Firestore write failed: ${err.message}`);
+      });
+    }
+
     added++;
   }
 
-  // Trim ring buffer
+  // Trim in-memory ring buffer
   while (diagnosticLogs.length > MAX_DIAGNOSTIC_LOGS) {
     diagnosticLogs.shift();
   }
 
   console.log(`📋 Received ${added} diagnostic logs from ${user.email || user.uid} (${device})`);
-  res.json({ ok: true, received: added });
+  res.json({ ok: true, received: added, persistent: !!logsCol });
 });
 
 app.get('/api/logs', async (req, res) => {
-  // Auth optional for dev — in prod this should require admin auth
   let user;
   try {
     user = await authenticateRequest(req);
@@ -485,7 +510,26 @@ app.get('/api/logs', async (req, res) => {
   const deviceFilter = req.query.device || null;
   const tagFilter = req.query.tag || null;
 
-  let results = diagnosticLogs;
+  // Try Firestore first for persistent logs, fall back to in-memory
+  const logsCol = getLogsCollection();
+  let results;
+
+  if (logsCol && diagnosticLogs.length === 0) {
+    // Server restarted — pull from Firestore
+    try {
+      let query = logsCol.orderBy('ts', 'desc').limit(limit);
+      if (since) query = query.where('ts', '>=', since.toISOString());
+      if (deviceFilter) query = query.where('device', '==', deviceFilter);
+      if (tagFilter) query = query.where('tag', '==', tagFilter);
+      const snapshot = await query.get();
+      results = snapshot.docs.map(doc => doc.data()).reverse();
+    } catch (err) {
+      console.error(`[Logs] Firestore read failed: ${err.message}`);
+      results = diagnosticLogs; // fall back to in-memory
+    }
+  } else {
+    results = diagnosticLogs;
+  }
 
   if (since && !isNaN(since.getTime())) {
     results = results.filter(l => new Date(l.ts) >= since);
@@ -500,7 +544,38 @@ app.get('/api/logs', async (req, res) => {
   res.json({
     total: results.length,
     logs: results.slice(-limit),
+    persistent: !!logsCol,
   });
+});
+
+app.delete('/api/logs', async (req, res) => {
+  let user;
+  try {
+    user = await authenticateRequest(req);
+  } catch (error) {
+    res.status(401).json({ error: error.message });
+    return;
+  }
+
+  // Clear in-memory
+  diagnosticLogs.length = 0;
+
+  // Clear Firestore if available
+  const logsCol = getLogsCollection();
+  if (logsCol) {
+    try {
+      const snapshot = await logsCol.limit(500).get();
+      const batch = admin.firestore().batch();
+      snapshot.docs.forEach(doc => batch.delete(doc.ref));
+      await batch.commit();
+      console.log(`🗑️ Cleared ${snapshot.size} Firestore log entries`);
+    } catch (err) {
+      console.error(`[Logs] Firestore clear failed: ${err.message}`);
+    }
+  }
+
+  console.log(`🗑️ Logs cleared by ${user.email || user.uid}`);
+  res.json({ ok: true, cleared: true });
 });
 
 server.listen(PORT, () => {
