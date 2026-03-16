@@ -421,6 +421,51 @@ wss.on('connection', async (clientWs, req) => {
 });
 
 // ──────────────────────────────────────────────────────────
+// Ephemeral Token — GET /api/realtime-token
+// Returns a short-lived OpenAI Realtime API token so the iOS app
+// can connect DIRECTLY to OpenAI without proxying WebSocket frames
+// through this backend (Render's infrastructure corrupts WS relay).
+// ──────────────────────────────────────────────────────────
+app.get('/api/realtime-token', async (req, res) => {
+  try {
+    const user = await authenticateRequest(req);
+    if (!requireOpenAIKey(res)) return;
+
+    const response = await fetch('https://api.openai.com/v1/realtime/sessions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: REALTIME_MODEL,
+        modalities: ['text', 'audio'],
+        voice: 'coral',
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('❌ OpenAI session creation failed:', response.status, errorText);
+      return res.status(502).json({ error: 'Failed to create OpenAI session', details: errorText });
+    }
+
+    const session = await response.json();
+    console.log(`🎫 Ephemeral token issued for ${user.email || user.uid} — expires in 60s`);
+
+    res.json({
+      token: session.client_secret?.value,
+      expiresAt: session.client_secret?.expires_at,
+      model: session.model,
+      voice: session.voice,
+    });
+  } catch (error) {
+    console.error('❌ Token endpoint error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ──────────────────────────────────────────────────────────
 // Remote Diagnostic Logging — POST /api/logs
 // The iOS app ships voice-engine diagnostic logs here so we
 // can triage issues without Xcode attached.
