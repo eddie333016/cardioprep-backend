@@ -216,6 +216,11 @@ app.post('/api/score', async (req, res) => {
     return;
   }
 
+  if (transcript.length > 50000) {
+    res.status(400).json({ error: 'Transcript exceeds maximum length of 50,000 characters.' });
+    return;
+  }
+
   try {
     const score = await requestScoringFromOpenAI({ transcript, patientName });
     console.log(`📊 Scored transcript for ${user.email || user.uid} (${transcript.length} chars)`);
@@ -242,7 +247,7 @@ app.post('/api/conversation', async (req, res) => {
   const systemPrompt = typeof req.body?.systemPrompt === 'string' ? req.body.systemPrompt.trim() : '';
   const userMessage = typeof req.body?.userMessage === 'string' ? req.body.userMessage.trim() : '';
   const role = req.body?.role === 'examiner' ? 'examiner' : 'patient';
-  const history = Array.isArray(req.body?.history) ? req.body.history : [];
+  const history = Array.isArray(req.body?.history) ? req.body.history.slice(0, 50) : [];
 
   if (!systemPrompt || !userMessage) {
     res.status(400).json({ error: 'systemPrompt and userMessage are required.' });
